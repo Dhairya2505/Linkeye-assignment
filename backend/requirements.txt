@@ -4,3 +4,8 @@ langchain-text-splitters
 sentence-transformers
 faiss-cpu
 numpy
+langchain-google-genai
+python-dotenv
+langchain-google-genai
+fastapi
+uvicorn
