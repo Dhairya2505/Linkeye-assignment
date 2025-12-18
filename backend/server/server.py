@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from playwright.sync_api import sync_playwright
 import time
 import hashlib
@@ -13,8 +13,17 @@ from collections import defaultdict
 from dotenv import load_dotenv
 import os
 from langchain_google_genai import ChatGoogleGenerativeAI
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 load_dotenv()
 
@@ -36,7 +45,6 @@ CONTENT_SELECTOR = ".api-content-main"
 
 class Item(BaseModel):
     query: str
-
 
 def split_documents(documents, chunk_size=500, chunk_overlap=120):
     splitter = RecursiveCharacterTextSplitter(
@@ -78,13 +86,13 @@ def embed_documents(chunks, model_name="multi-qa-MiniLM-L6-cos-v1"):
 
     embeddings = model.encode(
         texts,
-        normalize_embeddings=True,   # IMPORTANT
+        normalize_embeddings=True,
         show_progress_bar=True
     )
 
     return embeddings
 
-def retrieve_chunks(query, index, id_to_doc, k=20, score_threshold=0.6):
+def retrieve_chunks(query, index, id_to_doc, k=20):
     model = SentenceTransformer("multi-qa-MiniLM-L6-cos-v1")
     query_emb = model.encode(
         query,
@@ -93,15 +101,18 @@ def retrieve_chunks(query, index, id_to_doc, k=20, score_threshold=0.6):
 
     D, I = index.search(query_emb, k)
 
-    docs = []
+    results = []
     for score, idx in zip(D[0], I[0]):
         if idx == -1:
             continue
-        if score < score_threshold:
-            continue
-        docs.append(id_to_doc[idx])
 
-    return docs
+        doc = id_to_doc[idx]
+        results.append({
+            "doc": doc,
+            "score": float(score)
+        })
+
+    return results
 
 
 @app.get("/ingest-data", status_code=200)
@@ -212,16 +223,59 @@ def data_ingestion():
 def get_answer(query: Item):
     
     index = faiss.read_index("docs.index")
-    embeddings = np.load("embeddings.npy")
 
     with open("docstore.pkl", "rb") as f:
         id_to_doc = pickle.load(f)
 
     chunks = retrieve_chunks(query.query, index, id_to_doc)
 
+    print("Total retrieved chunks:", len(chunks))
+    print("Sample scores:", [r["score"] for r in chunks[:5]])
+    print("Parents:", {r["doc"].metadata.get("parent_id") for r in chunks})
+
+    if not chunks:
+        return {
+            "answer": "I don't have enough information in the provided documents.",
+            "top_anchor_id": None,
+            "score": None
+        }
+
     grouped = defaultdict(list)
     for doc in chunks:
-        grouped[doc.metadata["parent_id"]].append(doc)
+        chunk = doc["doc"]
+        grouped[chunk.metadata["parent_id"]].append(chunk)
+
+    section_scores = defaultdict(float)
+    section_docs = defaultdict(list)
+
+    for item in chunks:
+        doc = item["doc"]
+        score = item["score"]
+
+        parent = doc.metadata.get("parent_id")
+        if not parent:
+            continue
+
+        section_docs[parent].append(item)
+        section_scores[parent] = max(section_scores[parent], score)
+    
+
+    if not section_scores:
+        return {
+            "answer": "I don't have enough information in the provided documents.",
+            "top_anchor_id": None,
+            "score": None
+        }
+
+    best_section = max(section_scores.items(), key=lambda x: x[1])
+    best_parent_id, best_score = best_section
+
+    best_chunk = max(
+        section_docs[best_parent_id],
+        key=lambda x: x["score"]
+    )
+
+    best_anchor_id = best_chunk["doc"].metadata.get("anchor_id")
 
     context_parts = []
 
@@ -235,6 +289,7 @@ def get_answer(query: Item):
     prompt = f"""
     You are a technical assistant.
     Answer ONLY using the provided context. Explain the answer in detail unsing the context.
+    Generate a readable answer with proper spacing.
     If the answer is not present in the context, say:
     "I don't have enough information in the provided documents."
     Do not use prior knowledge.
@@ -254,4 +309,8 @@ def get_answer(query: Item):
         ("human", query.query),
     ]
     ai_msg = model.invoke(messages)
-    return {"answer" : ai_msg.content}
+    return {
+        "answer" : ai_msg.content,
+        "top_anchor_id": best_anchor_id,
+        "score": round(best_score, 4)
+    }

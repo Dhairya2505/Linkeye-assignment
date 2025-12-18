@@ -6,3 +6,5 @@ faiss-cpu
 numpy
 langchain-google-genai
 python-dotenv
+fastapi
+uvicorn
