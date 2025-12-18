@@ -1,4 +1,6 @@
 playwright
-time
-hashlib
-json
+langchain-core
+langchain-text-splitters
+sentence-transformers
+faiss-cpu
+numpy
